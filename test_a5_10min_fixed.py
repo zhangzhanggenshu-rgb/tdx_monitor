@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-A5金叉死叉雷达系统 - 完全重构版 v2.1
+A5金叉死叉雷达系统 - 完全重构版 v2.2
 ==================================
-核心修复（不放宽条件）：
-1. 摆动点历史丢失 → 改为完整追踪（不能只取5个最新）
-2. 状态机逻辑混乱 → 改为严格的递进式状态转移
-3. recent[-3/-2/-1]访问越界 → 改为安全的索引检查
-4. 状态在state==3后立即重置 → 改为检查金叉才重置
+关键修复：
+1. 不再依赖 recent3[-3/-2/-1] 的固定模式
+2. 改为追踪实际的 LL/HH/HL 摆动点索引
+3. 状态转移基于摆动点价格的大小关系
+4. 完整的摆动点历史追踪
 """
 import os
 if os.name == 'nt':
@@ -19,7 +19,6 @@ import threading
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pytdx.hq import TdxHq_API
-from collections import deque
 
 try:
     import winsound
@@ -124,7 +123,6 @@ class SwingDetector:
         if confirm_idx < self.N or confirm_idx >= self.len - self.N:
             return
         
-        # 严格条件：左右各N根
         is_high = (self.highs[confirm_idx] == 
                    np.max(self.highs[confirm_idx-self.N:confirm_idx+self.N+1]))
         is_low = (self.lows[confirm_idx] == 
@@ -147,25 +145,26 @@ class SwingDetector:
 
 class StructureAnalyzer:
     """
-    结构分析器 - 修复逻辑
-    核心修复：
-    1. 保留完整的摆动点历史（不丢失）
-    2. 状态严格递进：0 → 1 → 2 → 3
-    3. 状态机触发条件明确
+    结构分析器 - 完全重新设计
+    核心思想：追踪实际的摆动点位置，而不是依赖固定的数组索引
     """
     def __init__(self):
-        self.state = 0  # 0初始 → 1找到LL → 2找到HH → 3找到HL
+        self.state = 0
+        self.ll_idx = None    # 第一个低点的索引
+        self.hh_idx = None    # 高点的索引
+        self.hl_idx = None    # 第二个低点的索引
+        
+        self.ll_price = None
         self.hh1_price = None
         self.hl_price = None
-        self.ll_price = None
-        self.all_swings = []  # 修复：保存完整历史，不用deque
+        
+        self.all_swings = []  # 完整的摆动点历史
     
     def update(self, new_swings):
         """
-        基于新的摆动点更新状态
-        修复：new_swings是所有摆动点，而不是仅最新的5个
+        根据新摆动点更新状态
+        关键：追踪摆动点本身，而不是数组索引
         """
-        # 追加新摆动点到历史
         if new_swings:
             for swing in new_swings:
                 if swing not in self.all_swings:
@@ -174,53 +173,49 @@ class StructureAnalyzer:
         if len(self.all_swings) < 2:
             return
         
-        # 只看最后3个摆动点来判断当前结构状态
-        # （但历史完整保存，不会丢失）
-        recent3 = self.all_swings[-3:] if len(self.all_swings) >= 3 else self.all_swings
-        
-        # 严格状态机：逐级递进
-        if self.state == 0:
-            # 找到初始LL
-            if len(recent3) >= 1 and recent3[-1][1] == 'L':
-                self.state = 1
-                self.ll_price = recent3[-1][2]
-        
-        elif self.state == 1:
-            # LL已找到，寻找HH（必须在LL之后且价格更高）
-            if len(recent3) >= 2:
-                if recent3[-2][1] == 'L' and recent3[-1][1] == 'H':
-                    if recent3[-1][2] > recent3[-2][2]:  # HH > LL
-                        self.state = 2
-                        self.hh1_price = recent3[-1][2]
-                        self.hl_price = None
-        
-        elif self.state == 2:
-            # LL→HH已找到，寻找HL（必须在HH之后且价格更低）
-            if len(recent3) >= 3:
-                if (recent3[-3][1] == 'L' and recent3[-2][1] == 'H' and recent3[-1][1] == 'L'):
-                    # 验证结构有效性
-                    ll_p = recent3[-3][2]
-                    hh_p = recent3[-2][2]
-                    hl_p = recent3[-1][2]
-                    
-                    # 必须满足：LL < HH, HL < HH, HL > LL
-                    if ll_p < hh_p and hl_p < hh_p and hl_p > ll_p:
-                        self.state = 3
-                        self.ll_price = ll_p
-                        self.hh1_price = hh_p
-                        self.hl_price = hl_p
-            elif len(recent3) == 2 and recent3[-2][1] == 'H' and recent3[-1][1] == 'L':
-                # 如果最后是HL，虽然没有前面的LL了，但假设前面有
-                # （这不应该发生，因为我们会保持state==2）
-                pass
+        # 逐个检查摆动点，更新状态
+        for idx, swing_type, price in self.all_swings:
+            if self.state == 0:
+                # 初始态：找到第一个低点（LL）
+                if swing_type == 'L':
+                    self.state = 1
+                    self.ll_idx = idx
+                    self.ll_price = price
+            
+            elif self.state == 1:
+                # 已有LL，寻找高点（HH）
+                # HH必须：
+                #  1. 在LL之后
+                #  2. 是高点
+                #  3. 价格 > LL价格
+                if swing_type == 'H' and idx > self.ll_idx and price > self.ll_price:
+                    self.state = 2
+                    self.hh_idx = idx
+                    self.hh1_price = price
+            
+            elif self.state == 2:
+                # 已有LL→HH，寻找低点（HL）
+                # HL必须：
+                #  1. 在HH之后
+                #  2. 是低点
+                #  3. 价格 < HH价格
+                #  4. 价格 > LL价格
+                if (swing_type == 'L' and idx > self.hh_idx and 
+                    price < self.hh1_price and price > self.ll_price):
+                    self.state = 3
+                    self.hl_idx = idx
+                    self.hl_price = price
     
     def is_ready(self):
         """结构是否就绪"""
         return self.state == 3 and self.hh1_price is not None
     
     def reset_after_signal(self):
-        """信号触发后重置（准备下一个信号）"""
+        """信号触发后重置"""
         self.state = 0
+        self.ll_idx = None
+        self.hh_idx = None
+        self.hl_idx = None
         self.ll_price = None
         self.hh1_price = None
         self.hl_price = None
@@ -245,28 +240,26 @@ class RealTimeAnalyzer:
         latest_signal = None
         signal_time_str = None
         
-        # 逐根K线处理
         for i in range(1, self.indicator.len):
             current_time = self.indicator.times[i]
             
-            # 只处理当天数据
             if current_time.strftime('%Y-%m-%d') != last_trading_day:
                 continue
             
-            # 第1步：更新摆动点检测
+            # 第1步：更新摆动点
             self.swing.update(i)
             
-            # 第2步：获取完整的摆动点列表
+            # 第2步：获取完整摆动点
             all_swings = self.swing.get_all_swings()
             
-            # 第3步：更新结构分析（完整历史，不丢失）
+            # 第3步：更新结构
             self.structure.update(all_swings)
             
             # 第4步：检测金叉
             crossover = self.indicator.get_crossover(i)
             
-            # 第5步：融合判断（金叉 + 结构就绪 + 突破HH1）
-            if crossover == 1:  # 发生金叉
+            # 第5步：融合判断
+            if crossover == 1:
                 close_price = round(self.df['close'].iloc[i], 2)
                 
                 if (self.structure.is_ready() and 
@@ -274,7 +267,6 @@ class RealTimeAnalyzer:
                     close_price > self.structure.hh1_price):
                     
                     current_time_sec = current_time
-                    # 避免重复信号
                     if (self.last_signal_time is None or 
                         (current_time_sec - self.last_signal_time).total_seconds() >= 60):
                         
@@ -282,7 +274,6 @@ class RealTimeAnalyzer:
                         signal_time_str = current_time.strftime('%Y-%m-%d %H:%M:%S')
                         self.last_signal_time = current_time_sec
                         
-                        # 修复：确认信号后才重置结构
                         self.structure.reset_after_signal()
         
         if not latest_signal:
@@ -325,7 +316,7 @@ def analyze(market, code):
 def run():
     """主程序"""
     print("="*70)
-    print("[系统] A5金叉死叉雷达 · 5分钟线 · v2.1 修复版")
+    print("[系统] A5金叉死叉雷达 · 5分钟线 · v2.2 修复版")
     print("="*70)
     
     stocks = load_stocks(STOCK_FILE)
